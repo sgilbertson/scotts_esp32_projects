@@ -34,7 +34,7 @@ cd receiver
 python3 receive.py --output test.wav --seconds 30
 ```
 
-The receiver prints the sending ESP32's address, saves a 32kHz 16-bit mono WAV file, and counts missing UDP packets. Lost packets are padded with silence to keep recording duration aligned. `--seconds 0` records until Ctrl-C. Open the resulting WAV in Audacity.
+The receiver prints the sending ESP32's address, saves a 32kHz 16-bit mono WAV file, and counts missing UDP packets. Lost packets are padded with silence to keep recording duration aligned. The first packet and final summary report `first_seq`; the summary also reports `last_seq`. Each gap reports its missing sequence range and its start/end time in the WAV, measured from the first accepted packet (including inserted silence), rather than wall-clock arrival time. `--seconds 0` records until Ctrl-C. Open the resulting WAV in Audacity.
 
 If no data arrives, check the PC IP, Wi-Fi isolation and Ubuntu firewall. For ufw, if enabled, allow the sender's UDP packets on port 3333 (prefer restricting to your LAN).
 

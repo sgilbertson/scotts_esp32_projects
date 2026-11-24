@@ -25,6 +25,8 @@ def main():
 
     sample_rate = None
     expected = None
+    first_sequence = None
+    last_sequence = None
     packet_count = 0
     lost_packets = 0
     out_of_order = 0
@@ -55,7 +57,9 @@ def main():
                 wav.setsampwidth(2)
                 wav.setframerate(sample_rate)
                 start = time.monotonic()
-                print(f'First packet from {address}, {rate} Hz, writing {args.output}', flush=True)
+                first_sequence = seq
+                print(f'First packet from {address}, seq={first_sequence}, {rate} Hz, '
+                      f'writing {args.output}', flush=True)
             if rate != sample_rate:
                 print('Unexpected sample-rate change; ignoring packet')
                 continue
@@ -69,13 +73,20 @@ def main():
                     # Missing samples are replaced by silence to preserve timing.
                     # Use last normal frame count (512 unless the firmware changes).
                     missing_frames = last_frames or frames
+                    gap_start = recorded / sample_rate
+                    gap_end = (recorded + missing_frames * delta) / sample_rate
+                    first_missing = expected
+                    last_missing = (seq - 1) & 0xFFFFFFFF
                     wav.writeframesraw(b'\x00\x00' * missing_frames * delta)
                     recorded += missing_frames * delta
-                    print(f'Missing {delta} packet(s) before seq={seq}', flush=True)
+                    print(f'Missing {delta} packet(s), seq={first_missing}..{last_missing}, '
+                          f'before seq={seq}; audio={gap_start:.3f}..{gap_end:.3f}s '
+                          f'from first_seq={first_sequence}', flush=True)
                 else:
                     out_of_order += 1
                     continue
             expected = (seq + 1) & 0xFFFFFFFF
+            last_sequence = seq
             last_frames = frames
             wav.writeframesraw(data[HEADER.size:])
             recorded += frames
@@ -89,7 +100,8 @@ def main():
             wav.close()
         sock.close()
         print(f'Packets={packet_count}, missing={lost_packets}, '
-              f'out-of-order={out_of_order}, audio={recorded / sample_rate if sample_rate else 0:.2f}s')
+              f'out-of-order={out_of_order}, audio={recorded / sample_rate if sample_rate else 0:.2f}s, '
+              f'first_seq={first_sequence}, last_seq={last_sequence}')
 
 
 if __name__ == '__main__':
