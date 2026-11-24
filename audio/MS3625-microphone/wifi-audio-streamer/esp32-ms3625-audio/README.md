@@ -50,6 +50,52 @@ If no data arrives, check the PC IP, Wi-Fi isolation and Ubuntu firewall. For uf
 - Packet header is 16 bytes, little-endian: magic `AUD0`, `uint32 sequence`, `uint16 frames`, `uint16 flags/reserved`, `uint32 sample_rate`; followed by little-endian int16 samples.
 - UDP is unauthenticated and unencrypted; use it only on a trusted local LAN.
 
+## Remote statistics (no USB connection needed)
+
+The network transmission task sends the same statistics line printed on Serial
+as a separate UDP broadcast every five seconds, on **port 3334** by default.
+It uses the current Wi-Fi subnet's broadcast address, so any listening computer
+on that LAN can receive it. Audio still goes only to `RECEIVER_IP:RECEIVER_PORT`.
+No diagnostic formatting or networking runs in the microphone capture task.
+
+On Ubuntu with OpenBSD netcat, listen in a second terminal:
+
+```bash
+nc -u -l -k 3334
+```
+
+Or display and save the output:
+
+```bash
+nc -u -l -k 3334 | tee esp32-stats.log
+```
+
+Start the listener before or during a recording. `-k` keeps the UDP listener
+accepting different source endpoints after ESP32 reconnections or resets.
+If your netcat variant uses different options, use OpenBSD netcat or
+`socat -u UDP4-RECV:3334,reuseaddr -` instead.
+If a firewall is active, allow inbound UDP 3334 from the ESP32/LAN.
+AP client isolation, guest networks, or broadcast filtering can prevent receipt;
+broadcasts normally stay within one subnet.
+
+Optionally define `STATS_PORT` in `include/config.h` to change the port; it must
+differ from the audio port. Existing configurations need no edits.
+
+`report` is a zero-based report ID incremented every reporting interval, including
+while disconnected. `uptime_ms` is milliseconds since boot (wraps after about
+49.7 days); `rssi_dbm` is signal strength, or 0 when disconnected. With this fixed
+512-frame firmware, the latest completed capture sequence is `capture - 1`
+(modulo 2^32, once capture is nonzero), which helps correlate receiver gaps.
+`stats_ok` and `stats_fail` count local acceptance/failure of earlier diagnostic
+sends; they exclude audio sends and the current report's own send result.
+
+Diagnostics are best effort: there are no retries or offline report backlog.
+During a Wi-Fi outage no broadcasts can be delivered; after recovery, cumulative
+counters expose losses even if intermediate reports went missing. A missing
+report alone does not prove capture stopped. The second socket is closed on link
+transitions or diagnostic send failures and recreated on the next attempt.
+Only one small datagram is attempted per reporting interval.
+
 ## Diagnostics and limits
 
 Five-second reports are cumulative since boot (32-bit counters wrap). `capture` counts complete captured blocks; `udp_ok` counts packets accepted by the local UDP stack, **not delivery acknowledgements**. `queue_drop` counts oldest-block evictions; `queue` is a current occupancy snapshot and `max` its lifetime high-water mark. All shared counters and ring state are protected by the same ESP32 spinlock; no lock is held across socket, I2S, or Serial operations.

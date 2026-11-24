@@ -5,6 +5,13 @@
 #include <cstring>
 #include "config.h"
 
+// Optional config.h override; existing configurations need no changes.
+#ifndef STATS_PORT
+#define STATS_PORT 3334
+#endif
+static_assert(STATS_PORT > 0 && STATS_PORT <= 65535, "Invalid STATS_PORT");
+static_assert(STATS_PORT != RECEIVER_PORT, "Statistics and audio need separate ports");
+
 // Original ESP32 + MS3625: SCK=26, WS=25, SD=33, L/R=GND.
 static constexpr int PIN_BCLK = 26, PIN_WS = 25, PIN_DATA = 33;
 // Experimentally verified; do not infer the receive slot from L/R wiring.
@@ -140,6 +147,9 @@ static void captureTask(void *) {
 
 static void networkTask(void *) {
   WiFiUDP udp; // Socket and outgoing scratch belong exclusively to this task.
+  WiFiUDP statsUdp; // Independent best-effort diagnostics, also network-task-only.
+  static char report[768]; // One short text datagram; no fragmentation required.
+  uint32_t reportId = 0, statsSent = 0, statsFailures = 0;
   static AudioBlock outgoing;
   bool wasConnected = false;
   uint32_t lastReconnect = millis(), lastReport = millis();
@@ -147,7 +157,8 @@ static void networkTask(void *) {
     const uint32_t now = millis();
     const bool connected = WiFi.status() == WL_CONNECTED;
     if (connected != wasConnected) {
-      udp.stop(); // Recreate socket after a link transition.
+      udp.stop(); // Recreate sockets after a link transition.
+      statsUdp.stop();
       wasConnected = connected;
     }
     if (!connected && now - lastReconnect >= RECONNECT_MS) {
@@ -193,19 +204,47 @@ static void networkTask(void *) {
       snapshot = stats;
       queued = occupancy;
       portEXIT_CRITICAL(&stateMux);
-      Serial.printf("capture=%lu udp_ok=%lu queue_drop=%lu queue=%u/%u max=%u "
+      // Snapshot under lock, then format and perform all I/O outside it.
+      // Report IDs advance even offline, exposing missed diagnostic intervals.
+      const uint32_t uptime = millis();
+      const bool reportConnected = WiFi.status() == WL_CONNECTED;
+      const int rssi = reportConnected ? WiFi.RSSI() : 0;
+      const int length = snprintf(report, sizeof(report),
+                    "report=%lu uptime_ms=%lu rssi_dbm=%d stats_ok=%lu stats_fail=%lu "
+                    "capture=%lu udp_ok=%lu queue_drop=%lu queue=%u/%u max=%u "
                     "i2s_error=%lu timeout=%lu partial=%lu dma_error=%lu "
                     "rx_overflow=%lu event_full_seen=%lu udp_fail=%lu wifi_abort=%lu "
                     "wifi=%d connects=%lu disconnects=%lu reconnect_attempts=%lu\n",
+          (unsigned long)reportId++, (unsigned long)uptime, rssi,
+          (unsigned long)statsSent, (unsigned long)statsFailures,
           (unsigned long)snapshot.captured, (unsigned long)snapshot.sent,
           (unsigned long)snapshot.queueDrops, (unsigned)queued, (unsigned)QUEUE_BLOCKS,
           (unsigned)snapshot.maxOccupancy, (unsigned long)snapshot.readErrors,
           (unsigned long)snapshot.readTimeouts, (unsigned long)snapshot.partialReads,
           (unsigned long)snapshot.dmaErrors, (unsigned long)snapshot.dmaOverflows,
           (unsigned long)snapshot.eventQueueFull, (unsigned long)snapshot.udpFailures,
-          (unsigned long)snapshot.wifiAborted, connected,
+          (unsigned long)snapshot.wifiAborted, reportConnected,
           (unsigned long)snapshot.connects, (unsigned long)snapshot.disconnects,
           (unsigned long)snapshot.reconnectAttempts);
+      if (length > 0 && static_cast<size_t>(length) < sizeof(report)) {
+        Serial.write(reinterpret_cast<const uint8_t *>(report), length);
+        if (reportConnected) {
+          // Recompute the subnet broadcast address for DHCP/network changes.
+          // Never retry diagnostics or add their failures to audio udp_fail.
+          bool ok = false;
+          if (statsUdp.beginPacket(WiFi.broadcastIP(), STATS_PORT)) {
+            const size_t written = statsUdp.write(
+                reinterpret_cast<const uint8_t *>(report), length);
+            const int result = statsUdp.endPacket();
+            ok = written == static_cast<size_t>(length) && result == 1;
+          }
+          if (ok) ++statsSent;
+          else {
+            ++statsFailures;
+            statsUdp.stop();
+          }
+        }
+      }
       lastReport = now;
     }
   }

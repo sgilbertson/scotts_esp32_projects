@@ -4,3 +4,7 @@
 #define WIFI_PASSWORD "your-wifi-password"
 #define RECEIVER_IP "192.168.1.123"  // IP address of your receiving device, such as a Linux PC
 #define RECEIVER_PORT 3333
+
+// Optional: subnet-broadcast text diagnostics every 5 seconds (default 3334).
+// Must differ from RECEIVER_PORT. Existing config.h files use the default.
+// #define STATS_PORT 3334
