@@ -3,6 +3,10 @@
 #include <WiFiUdp.h>
 #include <driver/i2s.h>
 #include <cstring>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#include <lwip/sockets.h>
 #include "config.h"
 
 // Optional config.h override; existing configurations need no changes.
@@ -24,6 +28,8 @@ static constexpr size_t QUEUE_BLOCKS = 32; // 512 ms / 32 KiB PCM.
 static constexpr int DMA_BUFFERS = 8, DMA_FRAMES = 256; // 64 ms stereo input.
 static constexpr int I2S_EVENT_DEPTH = 32;
 static constexpr uint32_t READ_TIMEOUT_MS = 100;
+// Bound each dequeued block's retry time; the 512 ms ring keeps capturing.
+static constexpr uint32_t SEND_RETRY_MS = 5, SEND_DEADLINE_MS = 100;
 static constexpr uint32_t REPORT_MS = 5000, RECONNECT_MS = 5000;
 static constexpr uint32_t CAPTURE_STACK_BYTES = 4096, NETWORK_STACK_BYTES = 6144;
 
@@ -145,19 +151,58 @@ static void captureTask(void *) {
   }
 }
 
+// Use a nonblocking socket for audio so errno is captured immediately after
+// sendto, before framework logging can change it. No per-attempt packet buffer.
+static bool transientSendError(int error) {
+  return error == ENOMEM || error == ENOBUFS || error == EAGAIN ||
+         error == EWOULDBLOCK || error == EINTR;
+}
+
+static void closeAudioSocket(int &fd) {
+  if (fd >= 0) close(fd);
+  fd = -1;
+}
+
+static int sendAudio(int &fd, const AudioBlock &block) {
+  if (fd < 0) {
+    fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) return errno;
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+      const int error = errno;
+      closeAudioSocket(fd);
+      return error;
+    }
+  }
+  sockaddr_in destination = {};
+  destination.sin_family = AF_INET;
+  destination.sin_port = htons(RECEIVER_PORT);
+  destination.sin_addr.s_addr = static_cast<uint32_t>(receiver);
+  const ssize_t sent = sendto(fd, block.packet, PACKET_BYTES, 0,
+      reinterpret_cast<const sockaddr *>(&destination), sizeof(destination));
+  if (sent < 0) return errno;
+  // UDP sends are atomic. Never retry a nonnegative unexpected short result.
+  return sent == PACKET_BYTES ? 0 : EIO;
+}
+
 static void networkTask(void *) {
-  WiFiUDP udp; // Socket and outgoing scratch belong exclusively to this task.
+  int audioSocket = -1; // Socket and outgoing scratch belong only to this task.
   WiFiUDP statsUdp; // Independent best-effort diagnostics, also network-task-only.
-  static char report[768]; // One short text datagram; no fragmentation required.
+  static char report[1400]; // One short text datagram; no fragmentation required.
   uint32_t reportId = 0, statsSent = 0, statsFailures = 0;
   static AudioBlock outgoing;
+  // These counters have a single owner: networkTask. No cross-task reads.
+  uint32_t retries = 0, recovered = 0, sendDrops = 0;
+  uint32_t noMemory = 0, noBuffers = 0, wouldBlock = 0, otherErrors = 0;
+  int lastSendError = 0;
+  bool haveBlock = false;
+  uint32_t blockStarted = 0, lastAttempt = 0, attempts = 0;
   bool wasConnected = false;
   uint32_t lastReconnect = millis(), lastReport = millis();
   for (;;) {
     const uint32_t now = millis();
     const bool connected = WiFi.status() == WL_CONNECTED;
     if (connected != wasConnected) {
-      udp.stop(); // Recreate sockets after a link transition.
+      closeAudioSocket(audioSocket); // Recreate sockets after a link transition.
       statsUdp.stop();
       wasConnected = connected;
     }
@@ -168,35 +213,59 @@ static void networkTask(void *) {
       ++stats.reconnectAttempts;
       portEXIT_CRITICAL(&stateMux);
     }
-    bool haveBlock = false;
-    if (connected) {
+    if (connected && !haveBlock) {
       portENTER_CRITICAL(&stateMux);
       if (occupancy) {
         outgoing = blocks[head];
         head = (head + 1) % QUEUE_BLOCKS;
         --occupancy;
         haveBlock = true;
+        blockStarted = now;
+        attempts = 0;
       }
       portEXIT_CRITICAL(&stateMux);
     }
     if (haveBlock) {
-      // No retries: failure consumes this sequence, visible as a receiver gap.
-      bool ok = false;
-      const bool linkAvailable = WiFi.status() == WL_CONNECTED;
-      if (linkAvailable && udp.beginPacket(receiver, RECEIVER_PORT)) {
-        const size_t written = udp.write(outgoing.packet, PACKET_BYTES);
-        const int result = udp.endPacket();
-        ok = written == PACKET_BYTES && result == 1;
+      if (WiFi.status() != WL_CONNECTED) {
+        portENTER_CRITICAL(&stateMux);
+        ++stats.wifiAborted;
+        portEXIT_CRITICAL(&stateMux);
+        haveBlock = false;
+      } else if (attempts && now - blockStarted >= SEND_DEADLINE_MS) {
+        // Deadline expiry discards this sequence; never re-enqueue or renumber.
+        ++sendDrops;
+        haveBlock = false;
+      } else if (!attempts || now - lastAttempt >= SEND_RETRY_MS) {
+        if (attempts) ++retries;
+        ++attempts;
+        lastAttempt = now;
+        const int error = sendAudio(audioSocket, outgoing);
+        if (error == 0) {
+          portENTER_CRITICAL(&stateMux);
+          ++stats.sent;
+          portEXIT_CRITICAL(&stateMux);
+          if (attempts > 1) ++recovered;
+          haveBlock = false;
+        } else {
+          lastSendError = error;
+          if (error == ENOMEM) ++noMemory;
+          else if (error == ENOBUFS) ++noBuffers;
+          else if (error == EAGAIN || error == EWOULDBLOCK) ++wouldBlock;
+          else ++otherErrors;
+          portENTER_CRITICAL(&stateMux);
+          ++stats.udpFailures; // Failed attempts, including later recovered sends.
+          portEXIT_CRITICAL(&stateMux);
+          if (!transientSendError(error)) {
+            closeAudioSocket(audioSocket);
+            ++sendDrops;
+            haveBlock = false;
+          }
+          // ENOMEM/ENOBUFS/EAGAIN keep the socket and same outgoing block.
+        }
       }
-      if (!ok) udp.stop();
-      portENTER_CRITICAL(&stateMux);
-      if (ok) ++stats.sent;
-      else if (!linkAvailable) ++stats.wifiAborted;
-      else ++stats.udpFailures;
-      portEXIT_CRITICAL(&stateMux);
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(2));
     }
+    // Yield while waiting for a retry; reports and reconnect logic keep running.
+    vTaskDelay(pdMS_TO_TICKS(1));
     if (now - lastReport >= REPORT_MS) {
       Statistics snapshot;
       size_t queued;
@@ -214,7 +283,10 @@ static void networkTask(void *) {
                     "capture=%lu udp_ok=%lu queue_drop=%lu queue=%u/%u max=%u "
                     "i2s_error=%lu timeout=%lu partial=%lu dma_error=%lu "
                     "rx_overflow=%lu event_full_seen=%lu udp_fail=%lu wifi_abort=%lu "
-                    "wifi=%d connects=%lu disconnects=%lu reconnect_attempts=%lu\n",
+                    "wifi=%d connects=%lu disconnects=%lu reconnect_attempts=%lu "
+                    "udp_retry=%lu udp_recovered=%lu udp_drop=%lu udp_errno=%d "
+                    "udp_enomem=%lu udp_enobufs=%lu udp_eagain=%lu udp_other=%lu "
+                    "heap_free=%lu heap_min=%lu heap_largest=%lu\n",
           (unsigned long)reportId++, (unsigned long)uptime, rssi,
           (unsigned long)statsSent, (unsigned long)statsFailures,
           (unsigned long)snapshot.captured, (unsigned long)snapshot.sent,
@@ -225,7 +297,12 @@ static void networkTask(void *) {
           (unsigned long)snapshot.eventQueueFull, (unsigned long)snapshot.udpFailures,
           (unsigned long)snapshot.wifiAborted, reportConnected,
           (unsigned long)snapshot.connects, (unsigned long)snapshot.disconnects,
-          (unsigned long)snapshot.reconnectAttempts);
+          (unsigned long)snapshot.reconnectAttempts,
+          (unsigned long)retries, (unsigned long)recovered, (unsigned long)sendDrops,
+          lastSendError, (unsigned long)noMemory, (unsigned long)noBuffers,
+          (unsigned long)wouldBlock, (unsigned long)otherErrors,
+          (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
+          (unsigned long)ESP.getMaxAllocHeap());
       if (length > 0 && static_cast<size_t>(length) < sizeof(report)) {
         Serial.write(reinterpret_cast<const uint8_t *>(report), length);
         if (reportConnected) {

@@ -45,7 +45,7 @@ If no data arrives, check the PC IP, Wi-Fi isolation and Ubuntu firewall. For uf
 - For quiet signals, amplify *digitally on the PC* during exploratory analysis rather than immediately adding gain in firmware. If clipping occurs, reduce any gain you subsequently add.
 - Capture runs at priority 4 on core 1; UDP runs at priority 2 on core 0, below the Wi-Fi stack. Arduino's idle loop runs at priority 1. Task stacks are 4096 and 6144 bytes respectively. I2S is installed from capture so its interrupt is allocated on core 1.
 - Eight DMA buffers of 256 stereo frames provide 64 ms of input buffering. A preallocated ring holds 32 complete 512-frame PCM blocks (512 ms, 33,280 bytes including headers). Capture and sender each own a separate scratch block; ring transfers use a short critical section shared with statistics. No network calls, logging, heap allocation, or waiting for queue space occurs in the steady-state capture path.
-- On a full ring, capture discards the **oldest queued block** and counts it. The sender leaves the ring alone while disconnected, so it retains the latest half-second of audio. One additional block can be in flight in the network task; socket stalls can delay that block beyond the ring's time window. Automatic Wi-Fi reconnection is enabled with explicit reconnect attempts every five seconds. Failed sends are not retried.
+- On a full ring, capture discards the **oldest queued block** and counts it. The sender leaves the ring alone while disconnected, so it retains the latest half-second of audio. One additional block can be in flight in the network task; socket stalls can delay that block beyond the ring's time window. Automatic Wi-Fi reconnection is enabled with explicit reconnect attempts every five seconds. Transient audio send failures are retried with a bounded deadline, as described below.
 - Every completed capture block receives a sequence number **before enqueue**, including blocks later evicted or unsuccessfully sent. Packets always contain 512 samples; partial I2S reads are accumulated across calls. The unchanged receiver detects sequence gaps (including uint32 wraparound) and inserts the correct amount of silence for discarded complete blocks. No wire-format or receiver change is required.
 - Packet header is 16 bytes, little-endian: magic `AUD0`, `uint32 sequence`, `uint16 frames`, `uint16 flags/reserved`, `uint32 sample_rate`; followed by little-endian int16 samples.
 - UDP is unauthenticated and unencrypted; use it only on a trusted local LAN.
@@ -102,9 +102,52 @@ Five-second reports are cumulative since boot (32-bit counters wrap). `capture` 
 
 `i2s_error` counts non-timeout read errors, `timeout` counts timeout results or zero-byte successful reads, and `partial` counts nonempty short reads (which are accumulated, not discarded). `dma_error` counts driver DMA error events; `rx_overflow` counts driver RX queue overflow events indicating overwritten input. `event_full_seen` warns that the driver event queue was observed full; event notifications may have been lost. Overflow events do **not** provide an exact lost-frame count. Other unreported driver/hardware losses cannot be ruled out, and sequence gaps cannot represent their unknown duration. A clean UDP loss report alone does not prove uninterrupted capture.
 
-`udp_fail` counts begin/write/end failures while the link initially appeared up; `wifi_abort` counts a dequeued block abandoned after the link went down. `wifi` is the polled link state; `connects` counts acquired-IP events (including initial connection), `disconnects` counts station disconnect events, and `reconnect_attempts` counts explicit retries. Transitions are counted by the asynchronous Wi-Fi callback, so a brief outage during a send is still counted. Reports themselves can be delayed by a blocked socket call without blocking capture.
+`udp_fail` counts failed audio socket/send attempts, including attempts later recovered by a retry; `wifi_abort` counts a dequeued block abandoned after the link went down. `wifi` is the polled link state; `connects` counts acquired-IP events (including initial connection), `disconnects` counts station disconnect events, and `reconnect_attempts` counts explicit retries. Transitions are counted by the asynchronous Wi-Fi callback, so a brief outage during a send is still counted. Reports themselves can be delayed by a blocked socket call without blocking capture.
 
 The receiver cannot distinguish queue loss from network loss using this header. It cannot detect losses before its first packet or after its last packet, and it does not handle ESP32 reset as a new session: restart the receiver after resetting the board. Long outages create large silence gaps on recovery, and the existing receiver allocates silence for a gap in one operation; use short deliberate outages for testing. UDP can still be dropped or reordered on the network or host. I2S failures of unknown duration are reported but cannot be padded accurately.
+
+## Audio send retries and error diagnostics
+
+Audio uses a nonblocking BSD UDP socket in the existing network task. This
+captures `errno` immediately after a failing socket operation, avoiding the
+Arduino UDP wrapper's per-failure logging. The broadcast statistics socket
+continues using `WiFiUDP`. Microphone capture and the receiver protocol are
+unchanged.
+
+For `ENOMEM`, `ENOBUFS`, `EAGAIN`/`EWOULDBLOCK`, or `EINTR`, the sender retains the
+same outgoing block and sequence and retries at least 5 ms apart, for up to
+100 ms from dequeue. No retry is initiated at or after the deadline. A successful
+local UDP send is never retried merely because delivery is unknown. Transient
+errors keep the socket open. Other errors discard the block and close the socket;
+the next block recreates it. A Wi-Fi interruption abandons the in-flight block
+and closes the socket on the observed link transition. Queue overflow still
+evicts the oldest queued audio independently; sustained congestion can therefore
+still cause loss. Scheduling and socket-call duration can delay processing of
+the deadline, but capture never waits for retries. Reports continue between
+attempts. Retry timing constants live with the other buffer/audio constants.
+
+Additional cumulative fields:
+
+- `udp_retry`: extra send attempts after a block's first attempt.
+- `udp_recovered`: blocks successfully sent after at least one failed attempt.
+- `udp_drop`: blocks abandoned due to retry deadline or a nontransient error.
+  `wifi_abort` separately counts in-flight blocks abandoned on link loss, and
+  `queue_drop` separately counts ring evictions.
+- `udp_errno`: most recent audio failure's numeric errno; initially zero and
+  retained after recovery. `udp_enomem`, `udp_enobufs`, `udp_eagain`, and
+  `udp_other` count failed attempts by error category (`EINTR` is in `udp_other`).
+  These include socket creation/configuration failures, not just `sendto` errors.
+- `heap_free`, `heap_min`, `heap_largest`: current free heap, minimum free heap
+  since boot, and largest currently allocatable block, in bytes. These describe
+  the ESP32 heap, not specifically Wi-Fi transmit-buffer availability.
+
+`udp_fail` now counts **attempt failures, not discarded blocks**. A rising
+`udp_fail` alongside rising `udp_recovered` and stable `udp_drop`/`queue_drop`
+means retries are rescuing audio. Receiver gaps should instead be compared with
+`udp_drop`, `wifi_abort`, and `queue_drop`, allowing for reporting intervals and
+possible additional network losses. Error 12 on this toolchain is `ENOMEM`;
+heap metrics help distinguish general heap pressure from fixed driver-buffer
+limits, but cannot prove the underlying reason on their own.
 
 ## Hardware verification
 
@@ -112,3 +155,9 @@ The receiver cannot distinguish queue loss from network loss using this header. 
 2. Under normal conditions, expect approximately 62.5 captures and sends per second, low queue occupancy, and zero queue drops, read errors/timeouts, DMA errors/overflows, and UDP failures. Short reads alone are not audio loss. Compare counter differences over the recording; counters include startup time before the receiver began listening.
 3. Briefly disable the access point for 2–5 seconds without resetting the ESP32. Capture should keep increasing, the queue should reach 32, and `queue_drop` should increase. Restore Wi-Fi: it should reconnect, sending should resume, and queue occupancy should fall. The receiver should report gaps and insert silence. Confirm no steadily growing latency after recovery. Repeat with the AP unavailable at boot.
 4. Exercise a busy/weak Wi-Fi link and compare several equal-length recordings against the previous firmware. Correlate queue drops and UDP failures with receiver gaps. A nonzero `rx_overflow` means capture was unable to drain input in time; do not call that recording lossless even if UDP reports no missing packets.
+
+5. With the retry firmware, repeat the long recording while saving broadcast
+   statistics. Check whether `udp_recovered` rises during disturbances and
+   whether receiver missing packets decrease. Watch `udp_drop`/`queue_drop` for
+   sustained overload, and `udp_enomem`/`heap_min`/`heap_largest` for clues about
+   buffer pressure. Briefly interrupt Wi-Fi and verify automatic recovery.
