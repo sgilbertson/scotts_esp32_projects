@@ -1,0 +1,44 @@
+# Examples to merge into the appropriate Home Assistant configuration sections.
+# Replace entity IDs with those created by ZHA. Do not paste duplicate top-level
+# keys into an existing configuration.yaml. Reload templates/automations afterward.
+
+template:
+  - binary_sensor:
+      - name: Laundry Finished Alexa
+        unique_id: laundry_finished_alexa
+        device_class: opening
+        availability: >-
+          {{ states('binary_sensor.laundry_buzz_detector_buzzer_detected')
+             not in ['unknown', 'unavailable'] }}
+        state: >-
+          {{ is_state('binary_sensor.laundry_buzz_detector_buzzer_detected', 'on') }}
+
+# Expose binary_sensor.laundry_finished_alexa via your HA Cloud/Alexa setup.
+# Make an Alexa routine triggered when that contact OPENS (on), announcing
+# "Your washing machine has finished". Alexa's contact semantics are independent
+# of the physical notion of a closed switch. Enable proactive events as required
+# by your Alexa integration. Direct pairing to an Echo is not the intended route.
+
+input_boolean:
+  laundry_finished:
+    name: Laundry Finished
+    icon: mdi:washing-machine
+
+automation:
+  - id: latch_laundry_finished
+    alias: Laundry buzzer detected
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.laundry_buzz_detector_buzzer_detected
+        from: "off"
+        to: "on"
+    actions:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.laundry_finished
+      # Optional: add light.turn_on with your actual light entity here.
+    mode: single
+
+# Clear input_boolean.laundry_finished manually or from a suitable automation.
+# Use that helper for a persistent dashboard/light indication, while the Alexa
+# template above follows the brief actual detection and rearms automatically.

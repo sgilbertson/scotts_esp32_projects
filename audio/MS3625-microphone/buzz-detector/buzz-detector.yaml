@@ -1,0 +1,216 @@
+substitutions:
+  device_name: laundry-buzz-detector
+  bclk_pin: "4"
+  ws_pin: "5"
+  data_pin: "12"
+  report_period: 2s
+
+esphome:
+  name: ${device_name}
+  friendly_name: Laundry Buzz Detector
+  min_version: 2026.11.1
+esp32:
+  board: esp32-h2-devkitm-1
+  variant: esp32h2
+  framework:
+    type: esp-idf
+logger:
+  level: INFO
+  hardware_uart: USB_SERIAL_JTAG
+external_components:
+  - source:
+      type: local
+      path: components
+zigbee:
+  id: zb
+  manufacturer: Scott
+  model: H2 Sound Detector
+  router: false
+  sleepy: false
+buzz_detector:
+  id: detector
+  bclk_pin: ${bclk_pin}
+  ws_pin: ${ws_pin}
+  data_pin: ${data_pin}
+  slot_index: 1
+  report_interval: ${report_period}
+  controls: [measurement, lookback, threshold, required, minimum, highpass, release, cooldown]
+  level: filtered_level
+  baseline: baseline_level
+  rise: level_rise
+  streak: qualifying_intervals
+  read_errors: capture_errors
+  overflows: dma_overflows
+  report_drops: result_drops
+  detected: buzzer_detected
+  ready: baseline_ready
+sensor:
+  - platform: template
+    id: filtered_level
+    name: "Filtered Level"
+    update_interval: never
+    accuracy_decimals: 1
+    endpoint: 1
+    report: force
+    unit_of_measurement: "dB"
+  - platform: template
+    id: baseline_level
+    name: "Baseline Level"
+    update_interval: never
+    accuracy_decimals: 1
+    endpoint: 2
+    report: force
+    unit_of_measurement: "dB"
+  - platform: template
+    id: level_rise
+    name: "Level Rise"
+    update_interval: never
+    accuracy_decimals: 1
+    endpoint: 3
+    report: force
+    unit_of_measurement: "dB"
+  - platform: template
+    id: qualifying_intervals
+    name: "Qualifying Intervals"
+    update_interval: never
+    accuracy_decimals: 0
+    endpoint: 4
+    report: force
+    filters:
+      - delta: 1
+  - platform: template
+    id: capture_errors
+    name: "Capture Errors"
+    update_interval: never
+    accuracy_decimals: 0
+    endpoint: 5
+    report: force
+    filters:
+      - delta: 1
+  - platform: template
+    id: dma_overflows
+    name: "DMA Overflows"
+    update_interval: never
+    accuracy_decimals: 0
+    endpoint: 6
+    report: force
+    filters:
+      - delta: 1
+  - platform: template
+    id: result_drops
+    name: "Result Drops"
+    update_interval: never
+    accuracy_decimals: 0
+    endpoint: 7
+    report: force
+    filters:
+      - delta: 1
+binary_sensor:
+  - platform: gpio
+    id: reset_pairing
+    internal: true
+    pin:
+      number: GPIO9
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 5s
+    on_press:
+      - zigbee.factory_reset
+  - platform: template
+    id: buzzer_detected
+    name: "Buzzer Detected"
+    endpoint: 8
+    report: force
+  - platform: template
+    id: baseline_ready
+    name: "Baseline Ready"
+    endpoint: 9
+    report: force
+number:
+  - platform: template
+    id: measurement
+    name: "Measurement Interval"
+    optimistic: true
+    restore_value: true
+    initial_value: 500
+    min_value: 100
+    max_value: 2000
+    step: 100
+    endpoint: 10
+    unit_of_measurement: "ms"
+  - platform: template
+    id: lookback
+    name: "Lookback"
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 0.5
+    max_value: 30
+    step: 0.5
+    endpoint: 11
+    unit_of_measurement: "s"
+  - platform: template
+    id: threshold
+    name: "Rise Threshold"
+    optimistic: true
+    restore_value: true
+    initial_value: 12
+    min_value: 1
+    max_value: 60
+    step: 1
+    endpoint: 12
+    unit_of_measurement: "dB"
+  - platform: template
+    id: required
+    name: "Required Intervals"
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 1
+    max_value: 100
+    step: 1
+    endpoint: 13
+  - platform: template
+    id: minimum
+    name: "Minimum Level"
+    optimistic: true
+    restore_value: true
+    initial_value: -60
+    min_value: -120
+    max_value: 0
+    step: 1
+    endpoint: 14
+    unit_of_measurement: "dB"
+  - platform: template
+    id: highpass
+    name: "Highpass Cutoff"
+    optimistic: true
+    restore_value: true
+    initial_value: 2500
+    min_value: 0
+    max_value: 12000
+    step: 100
+    endpoint: 15
+    unit_of_measurement: "Hz"
+  - platform: template
+    id: release
+    name: "Release Intervals"
+    optimistic: true
+    restore_value: true
+    initial_value: 1
+    min_value: 1
+    max_value: 20
+    step: 1
+    endpoint: 16
+  - platform: template
+    id: cooldown
+    name: "Cooldown"
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    min_value: 0
+    max_value: 300
+    step: 1
+    endpoint: 17
+    unit_of_measurement: "s"
