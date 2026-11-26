@@ -358,7 +358,16 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // Never wait for association in capture.
+#ifdef WIFI_BSSID_BYTES
+  static const uint8_t preferredBssid[] = WIFI_BSSID_BYTES;
+  static_assert(sizeof(preferredBssid) == 6, "WIFI_BSSID_BYTES must contain six bytes");
+  // Channel 0 scans all channels for this AP, including after mesh changes.
+  // Reconnect uses the same station configuration, retaining the BSSID lock.
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, 0, preferredBssid);
+#else
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#endif
+  // Association is asynchronous; capture never waits for the selected AP.
   Serial.println("32 kHz mono, slot 1; capture core 1 / UDP core 0; queue 512 ms");
   // Arduino loop runs at priority 1. Capture blocks on DMA at priority 4;
   // network priority 2 on core 0 stays below the ESP32 Wi-Fi stack tasks.

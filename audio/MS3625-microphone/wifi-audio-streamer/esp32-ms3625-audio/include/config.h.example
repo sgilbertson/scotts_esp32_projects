@@ -8,3 +8,7 @@
 // Optional: subnet-broadcast text diagnostics every 5 seconds (default 3334).
 // Must differ from RECEIVER_PORT. Existing config.h files use the default.
 // #define STATS_PORT 3334
+
+// Optional: restrict association to one AP radio in a mesh (no fallback).
+// Channel discovery remains automatic. Omit this to allow any matching AP.
+// #define WIFI_BSSID_BYTES {0x30, 0x23, 0x03, 0x30, 0x65, 0x24}

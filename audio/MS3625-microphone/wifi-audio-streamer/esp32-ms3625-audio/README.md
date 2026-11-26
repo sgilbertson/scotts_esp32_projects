@@ -167,3 +167,23 @@ limits, but cannot prove the underlying reason on their own.
    whether receiver missing packets decrease. Watch `udp_drop`/`queue_drop` for
    sustained overload, and `udp_enomem`/`heap_min`/`heap_largest` for clues about
    buffer pressure. Briefly interrupt Wi-Fi and verify automatic recovery.
+
+## Pinning to a mesh node
+
+Optionally add this to `include/config.h` to connect only to the nearby node's
+2.4 GHz radio:
+
+```cpp
+#define WIFI_BSSID_BYTES {0x30, 0x23, 0x03, 0x30, 0x65, 0x24}
+```
+
+Replace the six bytes with your desired BSSID. The existing SSID and password
+still apply. Channel discovery stays automatic, so a channel change does not
+require recompiling. Initial connection and reconnection retain this BSSID
+restriction. There is **no fallback** to other nodes if the chosen node is
+unavailable; capture continues and the bounded queue discards old audio.
+Remove/comment the definition to restore automatic AP selection.
+
+After uploading, verify `bssid=30:23:03:30:65:24` in the broadcast statistics;
+the supplied scanner showed channel 8, but the mesh may change it. Compare
+RSSI, queue drops, retry-deadline drops, and receiver gaps at the same location.
