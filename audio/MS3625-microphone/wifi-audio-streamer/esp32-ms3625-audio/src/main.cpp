@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <driver/i2s.h>
+#include <esp_wifi.h>
 #include <cstring>
 #include <cerrno>
 #include <fcntl.h>
@@ -277,9 +278,21 @@ static void networkTask(void *) {
       // Report IDs advance even offline, exposing missed diagnostic intervals.
       const uint32_t uptime = millis();
       const bool reportConnected = WiFi.status() == WL_CONNECTED;
-      const int rssi = reportConnected ? WiFi.RSSI() : 0;
+      // One driver snapshot keeps BSSID, channel and RSSI tied to the same AP.
+      // Query only from the network task, outside the capture/statistics lock.
+      wifi_ap_record_t ap = {};
+      const bool haveAp = reportConnected && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+      const int rssi = haveAp ? ap.rssi : 0;
+      const unsigned channel = haveAp ? ap.primary : 0;
+      char bssid[18] = "unavailable";
+      if (haveAp) {
+        snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 ap.bssid[0], ap.bssid[1], ap.bssid[2],
+                 ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+      }
       const int length = snprintf(report, sizeof(report),
-                    "report=%lu uptime_ms=%lu rssi_dbm=%d stats_ok=%lu stats_fail=%lu "
+                    "report=%lu uptime_ms=%lu rssi_dbm=%d bssid=%s channel=%u "
+                    "stats_ok=%lu stats_fail=%lu "
                     "capture=%lu udp_ok=%lu queue_drop=%lu queue=%u/%u max=%u "
                     "i2s_error=%lu timeout=%lu partial=%lu dma_error=%lu "
                     "rx_overflow=%lu event_full_seen=%lu udp_fail=%lu wifi_abort=%lu "
@@ -287,7 +300,7 @@ static void networkTask(void *) {
                     "udp_retry=%lu udp_recovered=%lu udp_drop=%lu udp_errno=%d "
                     "udp_enomem=%lu udp_enobufs=%lu udp_eagain=%lu udp_other=%lu "
                     "heap_free=%lu heap_min=%lu heap_largest=%lu\n",
-          (unsigned long)reportId++, (unsigned long)uptime, rssi,
+          (unsigned long)reportId++, (unsigned long)uptime, rssi, bssid, channel,
           (unsigned long)statsSent, (unsigned long)statsFailures,
           (unsigned long)snapshot.captured, (unsigned long)snapshot.sent,
           (unsigned long)snapshot.queueDrops, (unsigned)queued, (unsigned)QUEUE_BLOCKS,

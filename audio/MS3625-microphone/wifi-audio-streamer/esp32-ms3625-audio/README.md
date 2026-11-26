@@ -83,7 +83,13 @@ differ from the audio port. Existing configurations need no edits.
 
 `report` is a zero-based report ID incremented every reporting interval, including
 while disconnected. `uptime_ms` is milliseconds since boot (wraps after about
-49.7 days); `rssi_dbm` is signal strength, or 0 when disconnected. With this fixed
+49.7 days). `bssid` identifies the connected access point radio (for example,
+`AA:BB:CC:DD:EE:FF`), and `channel` is its primary Wi-Fi channel. These identify
+which mesh node/radio is serving the ESP32; compare BSSIDs with your mesh app or
+Wi-Fi scanner. `rssi_dbm`, `bssid`, and `channel` come from one driver snapshot.
+When disconnected or that query fails, they are `0`, `unavailable`, and `0`
+respectively. Five-second snapshots can miss brief changes between reports.
+With this fixed
 512-frame firmware, the latest completed capture sequence is `capture - 1`
 (modulo 2^32, once capture is nonzero), which helps correlate receiver gaps.
 `stats_ok` and `stats_fail` count local acceptance/failure of earlier diagnostic
