@@ -29,12 +29,15 @@ pins 26/27, BOOT pin 9, UART pins 23/24, and board LEDs unused by I²S.
 The board profile `esp32-h2-devkitm-1` supplies the H2 target; the explicit pin
 assignments follow your pictured board, not the DevKit header layout.
 
-Capture remains 32 kHz with two 32-bit stereo slots, selecting **index 1** and
-shifting right 16 bits to signed PCM16, matching the proven original setup.
-This uses ESP-IDF's standard I²S API because the H2 differs from the original
-ESP32. The slot must still be verified on the new hardware: compare filtered
-level during quiet and buzzer playback. Do not infer a slot change from L/R
-being grounded. Do not reuse the original ESP32 GPIO26/25/33 wiring.
+Capture remains 32 kHz with two 32-bit stereo slots, shifting the selected
+word right 16 bits to signed PCM16. The H2 selects **index 0**, verified on the
+actual board after repairing the microphone's VDD solder joint: slot 0 had
+substantial PCM peaks (up to 31807 in the diagnostic recording), while slot 1
+contained only raw values of magnitude 0 or 1. This is receive-slot selection,
+not a gain/alignment adjustment. The original ESP32 recording project retains
+its independently verified **index 1**; do not transfer the H2 setting to it.
+The H2 uses ESP-IDF's standard I²S API. Recheck both slots when changing boards
+or drivers, and do not reuse original ESP32 GPIO26/25/33 wiring.
 
 ## Build and flash separately
 
@@ -73,8 +76,8 @@ use USB for firmware changes. Do not hold BOOT during reset except to flash.
 3. Allow the device interview to finish, then inspect its entities. Endpoints
    1–7 are measurements/diagnostics, 8–9 are detection/readiness, and 10–17
    are adjustable numbers. Names and entity IDs may vary with ZHA version.
-4. To erase pairing, hold the board's BOOT button for five seconds **after the
-   firmware has started**. This runs ESPHome's Zigbee factory-reset action.
+4. To erase pairing, hold the board's BOOT button for 5–10 seconds **after the
+   firmware has started**, then release it. This runs ESPHome's Zigbee factory-reset action.
    Then enable ZHA joining and restart if necessary. This does not reset the
    persisted detector number settings; change those through ZHA.
 
@@ -131,7 +134,9 @@ Binary state changes are published immediately from the main loop. Filtered
 Level, Baseline Level, Level Rise and Qualifying Intervals are the main tuning
 measurements. Before warmup, baseline/rise are NaN (may display unavailable).
 
-Capture runs in a priority-5 FreeRTOS task. A bounded 16-result queue transfers
+Capture starts five seconds after setup in a priority-2 FreeRTOS task with an
+8192-byte stack. It yields one RTOS tick after every 256 frames (8 ms of audio),
+so a DMA backlog cannot continuously starve the single-core H2 main loop. A bounded 16-result queue transfers
 only window summaries to the ESPHome loop, where all entity/Zigbee operations
 occur. Queue and task allocations occur at startup. I²S read errors/timeouts,
 zero-byte reads, and driver RX queue overflows reset history and clear
@@ -190,3 +195,113 @@ positive recording is not enough to establish false-positive performance.
 References: [ESPHome Zigbee](https://esphome.io/components/zigbee/),
 [ESP32-H2 I²S](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32h2/api-reference/peripherals/i2s.html),
 [Home Assistant Alexa](https://www.home-assistant.io/integrations/alexa.smart_home/#binary-sensor).
+
+## Restart/interview troubleshooting
+
+Repeated ROM banners and `rst:0xc (SW_CPU)` mean the ESP32 is rebooting, not
+merely retrying ZHA pairing. That ROM reset code alone does not distinguish a
+panic, watchdog or an intentional restart. An interrupted device cannot finish
+its interview reliably. Do not reset the entire Zigbee network to troubleshoot
+one restarting device.
+
+The diagnostic firmware logs `Boot reset_reason=...` and an `alive` summary
+roughly every five seconds. It includes captured blocks, read errors, overflows,
+result drops, maximum DSP-block processing wall time, minimum free capture-task
+stack, and current free heap. Zigbee debug logs are enabled; noisy per-sensor
+state logs are suppressed. Panic reboot is delayed three seconds to make its
+output more likely to reach USB. Watchdogs remain enabled. Scheduling/stack
+changes are precautionary; without a backtrace the original cause is unconfirmed.
+
+Rebuild and upload the normal configuration, then capture from startup:
+
+```bash
+.venv/bin/esphome compile buzz-detector.yaml
+.venv/bin/esphome upload buzz-detector.yaml --device /dev/ttyACM0
+.venv/bin/esphome logs buzz-detector.yaml --device /dev/ttyACM0 2>&1 | tee restart-test.log
+```
+
+If it still resets, isolate audio with this diagnostic build (no microphone
+reads or capture task; detection remains off):
+
+```bash
+.venv/bin/esphome -s capture_enabled false compile buzz-detector.yaml
+.venv/bin/esphome -s capture_enabled false upload buzz-detector.yaml --device /dev/ttyACM0
+.venv/bin/esphome -s capture_enabled false logs buzz-detector.yaml --device /dev/ttyACM0 2>&1 | tee zigbee-only-test.log
+```
+
+Use the same substitution for compilation and upload. This build still exposes
+the same endpoints, so it tests the Zigbee/interview path independently of
+capture without re-pairing for an endpoint-layout change. If it remains stable
+only with capture disabled, investigate capture timing, stack, and I²S setup.
+If it still resets, examine the new reset reason/backtrace and Zigbee logs.
+Recompile and upload normally afterward to restore audio. Once firmware is
+stable, retry the interview; remove/re-pair only this device if ZHA retains an
+incomplete interview. No firmware has been uploaded by the coding agent.
+
+### Software reset versus coordinator failure
+
+A diagnostic `Boot reset_reason=3` indicates a software restart path, unlike
+reset reason 4 (panic) or 6 (task watchdog). It does not identify the requesting
+component. The BOOT input now logs its transitions and requires a debounced
+5–10-second press **followed by release** before factory-resetting pairing.
+The request itself is logged before invoking the reset action. A permanently
+asserted input cannot repeatedly trigger that action just by remaining held.
+The Zigbee stack can also request resets independently; no SDK reset behaviour
+is patched here.
+
+If the HA log says `Coordinator is disconnected, cannot send request`, restore
+ZHA's connection to its coordinator before repeating an interview. Check an
+existing Zigbee device, reload ZHA, and if needed restart Home Assistant and
+check the coordinator's USB/network transport. A backlog of hundreds of
+thousands of queued requests and multi-day delays indicates a broader problem
+than this detector's interview. Avoid deleting the integration or resetting the
+coordinator/network merely to retry one device. If this H2 still restarts once
+the coordinator is healthy, collect both BOOT transition and Zigbee messages
+around the reset, then use the capture-disabled diagnostic build if needed.
+
+### Trace a software restart during joining
+
+The diagnostic build enables RISC-V EH-frame unwinding and registers an IDF
+shutdown handler. Calls through `esp_restart()` print
+`BUZZ: esp_restart requested from task ...` and a caller backtrace. A small
+RTC breadcrumb also reports the requesting task after reboot if USB loses the
+last messages. The breadcrumb is only trusted following a software reset and
+cleared after reading; this does not replace a full backtrace. Direct hardware
+resets or SDK paths bypassing `esp_restart()` will not invoke this handler.
+The handler observes the reset and never prevents it or clears Zigbee state.
+
+Retain the `.esphome/build/laundry-buzz-detector/build/firmware.elf` matching
+the flashed binary for address decoding. Capture-disabled builds use the same
+shutdown trace and are the next isolation test for resets that only happen
+while joining/interviewing. If both builds reset, focus on the Zigbee/SDK path;
+if only capture-enabled builds reset, investigate audio/Zigbee interaction.
+The symbol/unwind data increases diagnostic image size; remove this diagnostic
+setting/handler together later if no longer needed.
+
+### Baseline ready but level stuck at −160 dBFS
+
+Baseline readiness means measurement windows/history are available, not that
+sound was received. −160 dBFS is the detector's numerical power floor. Inspect
+the five-second `audio` serial line while speaking/clapping near the microphone.
+For **both** slots it reports peak signed-32-bit magnitude as hex, peak PCM16
+magnitude, and count of nonzero raw words over approximately the preceding
+report interval. Independent atomic snapshots may split a block between reports;
+these are signal diagnostics, not exact synchronized interval measurements.
+The selected slot and locally computed filtered level/baseline/rise are also
+logged, allowing comparison against Home Assistant without adding ZHA endpoints.
+
+- Both slots have zero raw peaks/nonzero counts: verify 3V3/GND, SCK=GPIO4,
+  WS=GPIO5, SD=GPIO12, L/R=GND, solder joints and header orientation. Clocks/DMA
+  can run successfully even with a disconnected microphone. Original ESP32
+  GPIO26/25/33 wiring is not the H2 wiring.
+- Slot 0 has substantial PCM activity but slot 1 has only raw 0/1 values:
+  this is the measured behaviour of this H2 setup. Use `slot_index: 0` (now the
+  default). A raw peak of 1 is insignificant low-bit activity, not evidence
+  for right-aligned microphone data. The original ESP32 streamer remains on 1.
+- Raw data is active but PCM peaks are zero/tiny: inspect alignment/scaling.
+- Local filtered level changes but ZHA stays fixed: investigate reporting.
+
+Read errors and DMA overflows invalidate history and force another warmup;
+a small one-time overflow count cannot explain persistent zero input. Wait for
+`Baseline Ready` after each reset/settings change. An isolated impulse is not
+expected to trigger a multi-second sound detector.

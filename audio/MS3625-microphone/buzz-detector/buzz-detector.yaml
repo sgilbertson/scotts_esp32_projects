@@ -4,6 +4,8 @@ substitutions:
   ws_pin: "5"
   data_pin: "12"
   report_period: 2s
+  capture_enabled: "true"
+  capture_start_delay: 5s
 
 esphome:
   name: ${device_name}
@@ -14,8 +16,16 @@ esp32:
   variant: esp32h2
   framework:
     type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS: "3"
+      # Enable a runtime unwind on this RISC-V chip for software-reset tracing.
+      CONFIG_ESP_SYSTEM_USE_EH_FRAME: "y"
 logger:
-  level: INFO
+  level: DEBUG
+  logs:
+    sensor: WARN
+    binary_sensor: WARN
+    number: WARN
   hardware_uart: USB_SERIAL_JTAG
 external_components:
   - source:
@@ -32,7 +42,10 @@ buzz_detector:
   bclk_pin: ${bclk_pin}
   ws_pin: ${ws_pin}
   data_pin: ${data_pin}
-  slot_index: 1
+  # H2 standard driver: verified by both-slot diagnostics; original ESP32 used 1.
+  slot_index: 0
+  capture_enabled: ${capture_enabled}
+  start_delay: ${capture_start_delay}
   report_interval: ${report_period}
   controls: [measurement, lookback, threshold, required, minimum, highpass, release, cooldown]
   level: filtered_level
@@ -114,9 +127,21 @@ binary_sensor:
       mode: INPUT_PULLUP
       inverted: true
     filters:
-      - delayed_on: 5s
-    on_press:
-      - zigbee.factory_reset
+      - delayed_on_off: 30ms
+    on_state:
+      - logger.log:
+          level: WARN
+          format: "BOOT input is %s"
+          args: ['x ? "pressed" : "released"']
+    on_click:
+      min_length: 5s
+      max_length: 10s
+      then:
+        - logger.log:
+            level: WARN
+            format: "BOOT held 5-10 seconds and released: requesting Zigbee factory reset"
+        - delay: 200ms
+        - zigbee.factory_reset
   - platform: template
     id: buzzer_detected
     name: "Buzzer Detected"

@@ -1,17 +1,53 @@
 #include "buzz_detector.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+#include <esp_system.h>
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
+#include <esp_debug_helpers.h>
+#include <esp_rom_sys.h>
+#include <esp_attr.h>
+#include <cstring>
 
 namespace esphome::buzz_detector {
 static const char *const TAG = "buzz_detector";
+namespace {
+// Retain the restarting task across a software reset even if USB output is lost.
+// A one-shot magic value and reset-reason check prevent stale power-up reports.
+struct RestartBreadcrumb { uint32_t magic; char task[configMAX_TASK_NAME_LEN]; };
+RTC_NOINIT_ATTR RestartBreadcrumb restart_breadcrumb;
+constexpr uint32_t RESTART_MAGIC = 0x42555A5A;
+void trace_software_restart() {
+  const char *task = pcTaskGetName(nullptr);
+  std::strncpy(restart_breadcrumb.task, task ? task : "unknown",
+               sizeof(restart_breadcrumb.task) - 1);
+  restart_breadcrumb.task[sizeof(restart_breadcrumb.task) - 1] = 0;
+  restart_breadcrumb.magic = RESTART_MAGIC;
+  // Shutdown callbacks run before the scheduler is suspended. Use the ROM
+  // console and IDF unwinder rather than the buffered ESPHome task logger.
+  esp_rom_printf("BUZZ: esp_restart requested from task %s; caller backtrace follows\n",
+                 restart_breadcrumb.task);
+  esp_backtrace_print(16);
+}
+}  // namespace
 void BuzzDetector::setup() {
+  setup_ms_ = millis();
+  if (esp_reset_reason() == ESP_RST_SW && restart_breadcrumb.magic == RESTART_MAGIC) {
+    restart_breadcrumb.task[sizeof(restart_breadcrumb.task) - 1] = 0;
+    ESP_LOGW(TAG, "Previous software restart requested from task: %s", restart_breadcrumb.task);
+  }
+  restart_breadcrumb.magic = 0;
+  const esp_err_t trace_status = esp_register_shutdown_handler(trace_software_restart);
+  if (trace_status != ESP_OK) ESP_LOGW(TAG, "Cannot register restart trace: %d", trace_status);
+  ESP_LOGI(TAG, "Boot reset_reason=%d (3=software, 4=panic, 6=task WDT), capture=%s",
+           static_cast<int>(esp_reset_reason()), capture_enabled_ ? "enabled" : "disabled");
   // Allocate once. Only small interval results cross to the ESPHome/Zigbee loop.
   settings_queue_ = xQueueCreate(1, sizeof(buzz::Settings));
   result_queue_ = xQueueCreate(16, sizeof(buzz::Result));
   if (!settings_queue_ || !result_queue_) { mark_failed(); return; }
   detected_->publish_state(false);
   ready_->publish_state(false);
-  if (xTaskCreate(task_entry, "buzz-capture", 6144, this, 5, nullptr) != pdPASS) mark_failed();
+  // Start later from loop(): setup, Zigbee startup and config logging finish first.
 }
 void BuzzDetector::dump_config() {
   ESP_LOGCONFIG(TAG, "32 kHz I2S: BCLK=%d WS=%d DIN=%d slot=%u", bclk_, ws_, data_, slot_);
@@ -76,10 +112,38 @@ void BuzzDetector::capture() {
     filled += bytes;
     if (filled != sizeof(samples)) { if (!bytes) vTaskDelay(1); continue; }
     filled = 0;
+    const int64_t processing_start = esp_timer_get_time();
+    uint32_t raw_peak[2]{}, pcm_peak[2]{}, nonzero[2]{};
     for (unsigned i = 0; i < 256; ++i) {
+      // Inspect both slots without changing which one feeds the detector.
+      for (unsigned slot = 0; slot < 2; ++slot) {
+        const int32_t raw = samples[2*i + slot];
+        const uint32_t magnitude = raw < 0 ? -static_cast<int64_t>(raw) : raw;
+        const int32_t pcm = static_cast<int16_t>(raw >> 16);
+        raw_peak[slot] = std::max(raw_peak[slot], magnitude);
+        pcm_peak[slot] = std::max(pcm_peak[slot], static_cast<uint32_t>(pcm < 0 ? -pcm : pcm));
+        nonzero[slot] += raw != 0;
+      }
       buzz::Result result;
       if (detector.sample(static_cast<int16_t>(samples[2*i + slot_] >> 16), result)) submit(result);
     }
+    // One atomic aggregation per block, not per sample. Main loop exchanges
+    // peaks/counts at reporting time; CAS avoids losing a concurrent new peak.
+    for (unsigned slot = 0; slot < 2; ++slot) {
+      auto update_peak = [](std::atomic<uint32_t> &peak, uint32_t value) {
+        uint32_t old = peak.load(std::memory_order_relaxed);
+        while (old < value && !peak.compare_exchange_weak(old, value, std::memory_order_relaxed)) {}
+      };
+      update_peak(raw_peak_[slot], raw_peak[slot]);
+      update_peak(pcm_peak_[slot], pcm_peak[slot]);
+      nonzero_[slot].fetch_add(nonzero[slot], std::memory_order_relaxed);
+    }
+    const uint32_t elapsed = esp_timer_get_time() - processing_start;
+    if (elapsed > max_dsp_us_.load()) max_dsp_us_.store(elapsed);
+    blocks_.fetch_add(1);
+    // The H2 has one core. Even a DMA backlog must not monopolize it: allow
+    // Zigbee, the ESPHome loop and idle to run once per 8 ms audio block.
+    vTaskDelay(1);
   }
 }
 void BuzzDetector::loop() {
@@ -89,6 +153,36 @@ void BuzzDetector::loop() {
     mark_failed(); return;
   }
   if (is_failed()) return;
+  const uint32_t uptime = millis();
+  if (capture_enabled_ && !task_started_ && uptime - setup_ms_ >= start_delay_) {
+    ESP_LOGI(TAG, "Starting capture: priority=2 stack=8192, yielding every 256 frames");
+    if (xTaskCreate(task_entry, "buzz-capture", 8192, this, 2, &capture_task_) != pdPASS) {
+      ESP_LOGE(TAG, "Cannot create capture task");
+      mark_failed(); return;
+    }
+    task_started_ = true;
+  }
+  if (uptime - heartbeat_ms_ >= 5000) {
+    ESP_LOGI(TAG, "alive uptime_ms=%lu blocks=%lu read_errors=%lu overflows=%lu result_drops=%lu "
+             "dsp_us_max=%lu stack_free=%u heap_free=%u",
+             static_cast<unsigned long>(uptime), static_cast<unsigned long>(blocks_.load()),
+             static_cast<unsigned long>(errors_.load()), static_cast<unsigned long>(overflows_count_.load()),
+             static_cast<unsigned long>(drops_.load()), static_cast<unsigned long>(max_dsp_us_.load()),
+             capture_task_ ? static_cast<unsigned>(uxTaskGetStackHighWaterMark(capture_task_)) : 0,
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+    ESP_LOGI(TAG, "audio slot0_raw_peak=0x%08lX slot0_pcm_peak=%lu slot0_nonzero=%lu "
+             "slot1_raw_peak=0x%08lX slot1_pcm_peak=%lu slot1_nonzero=%lu "
+             "selected=%u level_dbfs=%.1f baseline_dbfs=%.1f rise_db=%.1f ready=%u",
+             static_cast<unsigned long>(raw_peak_[0].exchange(0)),
+             static_cast<unsigned long>(pcm_peak_[0].exchange(0)),
+             static_cast<unsigned long>(nonzero_[0].exchange(0)),
+             static_cast<unsigned long>(raw_peak_[1].exchange(0)),
+             static_cast<unsigned long>(pcm_peak_[1].exchange(0)),
+             static_cast<unsigned long>(nonzero_[1].exchange(0)), slot_,
+             latest_result_.level, latest_result_.baseline, latest_result_.rise,
+             latest_result_.ready);
+    heartbeat_ms_ = uptime;
+  }
   auto value = [this](unsigned i, float fallback) {
     return controls_[i]->has_state() && std::isfinite(controls_[i]->state) ? controls_[i]->state : fallback;
   };
@@ -122,6 +216,7 @@ void BuzzDetector::loop() {
     // Entity publication and Zigbee reports happen only in the main loop.
     detected_->publish_state(result.detected);
     ready_->publish_state(result.ready);
+    latest_result_ = result;
     got = true;
   }
   if (got && now - last_report_ >= report_ms_) {

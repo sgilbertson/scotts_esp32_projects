@@ -17,6 +17,8 @@ class BuzzDetector : public Component {
   void loop() override;
   void dump_config() override;
   void set_pins(int b, int w, int d) { bclk_ = b; ws_ = w; data_ = d; }
+  void set_capture_enabled(bool enabled) { capture_enabled_ = enabled; }
+  void set_start_delay(uint32_t ms) { start_delay_ = ms; }
   void set_slot(unsigned slot) { slot_ = slot; }
   void set_report_interval(uint32_t ms) { report_ms_ = ms; }
   void set_control(unsigned i, number::Number *n) { controls_[i] = n; }
@@ -37,12 +39,19 @@ class BuzzDetector : public Component {
   number::Number *controls_[8]{};
   binary_sensor::BinarySensor *detected_ = nullptr, *ready_ = nullptr;
   int bclk_ = 4, ws_ = 5, data_ = 12;
-  unsigned slot_ = 1;
+  unsigned slot_ = 0;
   uint32_t report_ms_ = 2000, last_report_ = 0;
   buzz::Settings configured_;
   QueueHandle_t settings_queue_ = nullptr, result_queue_ = nullptr;
   std::atomic<uint32_t> errors_{0}, overflows_count_{0}, drops_{0};
   std::atomic<int> fatal_{0};
   uint32_t handled_drops_ = 0;
+  bool capture_enabled_ = true, task_started_ = false;
+  uint32_t setup_ms_ = 0, start_delay_ = 5000, heartbeat_ms_ = 0;
+  TaskHandle_t capture_task_ = nullptr;
+  std::atomic<uint32_t> blocks_{0}, max_dsp_us_{0};
+  std::atomic<uint32_t> raw_peak_[2]{}, pcm_peak_[2]{}, nonzero_[2]{};
+  buzz::Result latest_result_; // Main-loop-owned: compare local DSP with ZHA.
+
 };
 }
